@@ -52,50 +52,16 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
     // MARK: - Orientation Handling
 
     private func applyCurrentOrientation() {
-        if usingWideFrontSensor {
-            applyForcedLandscapeIfNeeded()
-            return
-        }
-
         guard let connection = movieOutput.connection(with: .video) else { return }
 
-        if #available(iOS 17.0, *) {
-            let orientation = UIDevice.current.orientation
-            if orientation.isValidInterfaceOrientation,
-               let videoOrientation = videoOrientation(for: orientation) {
-                let angle: CGFloat
-                switch videoOrientation {
-                case .portrait: angle = 90
-                case .portraitUpsideDown: angle = 270
-                case .landscapeRight: angle = 0
-                case .landscapeLeft: angle = 180
-                @unknown default: angle = 90
-                }
-
-                if connection.isVideoRotationAngleSupported(angle) {
-                    connection.videoRotationAngle = angle
-                }
-            }
-        } else if connection.isVideoOrientationSupported {
-            let orientation = UIDevice.current.orientation
-            if orientation.isValidInterfaceOrientation,
-               let videoOrientation = videoOrientation(for: orientation) {
-                connection.videoOrientation = videoOrientation
-            }
+        if usingWideFrontSensor {
+            applyForcedLandscapeIfNeeded(on: connection)
+        } else {
+            applyPortraitOrientation(on: connection)
         }
 
         if connection.isVideoMirroringSupported {
             connection.isVideoMirrored = true
-        }
-    }
-
-    private func videoOrientation(for deviceOrientation: UIDeviceOrientation) -> AVCaptureVideoOrientation? {
-        switch deviceOrientation {
-        case .portrait: return .portrait
-        case .portraitUpsideDown: return .portraitUpsideDown
-        case .landscapeLeft: return .landscapeRight
-        case .landscapeRight: return .landscapeLeft
-        default: return nil
         }
     }
 
@@ -129,8 +95,18 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         }
     }
 
-    private func applyForcedLandscapeIfNeeded() {
-        guard usingWideFrontSensor, let connection = movieOutput.connection(with: .video) else { return }
+    private func applyPortraitOrientation(on connection: AVCaptureConnection) {
+        if #available(iOS 17.0, *) {
+            if connection.isVideoRotationAngleSupported(90) {
+                connection.videoRotationAngle = 90
+            }
+        } else if connection.isVideoOrientationSupported {
+            connection.videoOrientation = .portrait
+        }
+    }
+
+    private func applyForcedLandscapeIfNeeded(on connection: AVCaptureConnection) {
+        guard usingWideFrontSensor else { return }
 
         if #available(iOS 17.0, *) {
             if connection.isVideoRotationAngleSupported(0) {
@@ -138,10 +114,6 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
             }
         } else if connection.isVideoOrientationSupported {
             connection.videoOrientation = .landscapeRight
-        }
-
-        if connection.isVideoMirroringSupported {
-            connection.isVideoMirrored = true
         }
     }
 
@@ -203,10 +175,8 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
     private func buildCaptureSession(addAudio: Bool) -> Bool {
         guard !isConfigured else { return true }
 
-        if session.canSetSessionPreset(.hd4K3840x2160) {
-            session.sessionPreset = .hd4K3840x2160
-        } else if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
+        if session.canSetSessionPreset(.inputPriority) {
+            session.sessionPreset = .inputPriority
         } else {
             session.sessionPreset = .high
         }
