@@ -203,10 +203,8 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
     private func buildCaptureSession(addAudio: Bool) -> Bool {
         guard !isConfigured else { return true }
 
-        if session.canSetSessionPreset(.hd4K3840x2160) {
-            session.sessionPreset = .hd4K3840x2160
-        } else if session.canSetSessionPreset(.hd1920x1080) {
-            session.sessionPreset = .hd1920x1080
+        if session.canSetSessionPreset(.inputPriority) {
+            session.sessionPreset = .inputPriority
         } else {
             session.sessionPreset = .high
         }
