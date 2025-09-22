@@ -17,6 +17,10 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
 
     private var orientationObserver: NSObjectProtocol?
     private var usingWideFrontSensor = false
+    
+    // Smart framing properties
+    private var smartFramingObserver: NSKeyValueObservation?
+    private var currentVideoDevice: AVCaptureDevice?
 
     func startRecording() {
         ensureSessionReady { [weak self] ready in
@@ -31,6 +35,7 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
 
                 self.applyCurrentOrientation()
                 self.startObservingOrientationChanges()
+                self.startSmartFramingMonitoring()
 
                 let url = Self.documentsDirectory()
                     .appendingPathComponent("standbycam_\(Int(Date().timeIntervalSince1970)).mov")
@@ -46,6 +51,73 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
             guard self.movieOutput.isRecording else { return }
             self.movieOutput.stopRecording()
             self.stopObservingOrientationChanges()
+            self.stopSmartFramingMonitoring()
+        }
+    }
+
+    // MARK: - Smart Framing
+
+    @available(iOS 18.0, *)
+    private func startSmartFramingMonitoring() {
+        guard let monitor = currentVideoDevice?.smartFramingMonitor,
+              !monitor.isMonitoring else { return }
+
+        // Ensure at least one framing is enabled before starting monitoring
+        if monitor.enabledFramings.isEmpty {
+//            if monitor.supportedFramings.contains(.ratio16x9) {
+//                monitor.enabledFramings = [.ratio16x9]
+//            } else {
+                monitor.enabledFramings = monitor.supportedFramings
+//            }
+            print("Enabled framings prior to monitoring: \(monitor.enabledFramings)")
+        }
+
+        // Set up KVO observer for framing recommendations
+        smartFramingObserver = monitor.observe(\.recommendedFraming, options: [.new]) { [weak self] monitor, change in
+            guard let self = self,
+                  let framing = monitor.recommendedFraming else { return }
+            
+            Task { [weak self] in
+                await self?.applyRecommendedFraming(framing)
+            }
+        }
+
+        do {
+            try monitor.startMonitoring()
+            print("Smart framing monitoring started")
+        } catch {
+            print("Unable to start smart framing monitoring: \(error)")
+        }
+    }
+
+    @available(iOS 18.0, *)
+    private func stopSmartFramingMonitoring() {
+        smartFramingObserver?.invalidate()
+        smartFramingObserver = nil
+        
+        guard let monitor = currentVideoDevice?.smartFramingMonitor else { return }
+        monitor.stopMonitoring()
+        print("Smart framing monitoring stopped")
+    }
+
+    @available(iOS 18.0, *)
+    private func applyRecommendedFraming(_ framing: AVCaptureFraming) async {
+        guard let device = currentVideoDevice else { return }
+        
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            
+            do {
+                // Apply aspect ratio first, then zoom factor for smooth transition
+                try await device.setDynamicAspectRatio(framing.aspectRatio)
+                device.videoZoomFactor = CGFloat(framing.zoomFactor)
+                print("Applied smart framing - aspect ratio: \(framing.aspectRatio), zoom: \(framing.zoomFactor)")
+            } catch {
+                print("Failed to apply smart framing: \(error)")
+            }
+        } catch {
+            print("Failed to lock device for smart framing configuration: \(error)")
         }
     }
 
@@ -172,6 +244,66 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         }
     }
 
+    @available(iOS 18.0, *)
+    private func findAndConfigureSmartFramingDevice() -> AVCaptureDevice? {
+        let discoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera],
+            mediaType: .video,
+            position: .front
+        )
+
+        guard let device = discoverySession.devices.first,
+              let format = device.formats.first(where: { $0.isSmartFramingSupported }) else {
+            print("No smart framing compatible device found")
+            return nil
+        }
+
+        if device.activeFormat.isSmartFramingSupported {
+            print("Device already configured for smart framing")
+            return device
+        }
+
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.activeFormat = format
+            print("Successfully configured device for smart framing")
+            return device
+        } catch {
+            print("Failed to configure smart framing format: \(error)")
+            return nil
+        }
+    }
+
+    @available(iOS 18.0, *)
+    private func configureSmartFramingMonitor(for device: AVCaptureDevice) {
+        guard let monitor = device.smartFramingMonitor else {
+            print("No smart framing monitor available")
+            return
+        }
+
+        print("Supported framings: \(monitor.supportedFramings)")
+
+        // Prefer 16:9 ratio if supported, otherwise enable all supported framings
+//        if monitor.supportedFramings.contains(.ratio4x3) {
+//            monitor.enabledFramings = [.ratio16x9]
+//            print("Smart framing configured for 16:9 aspect ratio")
+//        } else if !monitor.supportedFramings.isEmpty {
+            monitor.enabledFramings = monitor.supportedFramings
+            print("Smart framing configured for all supported ratios: \(monitor.supportedFramings)")
+        
+        // Set initial dynamic aspect ratio to 16:9 if supported
+        Task {
+            do {
+//                try await device.setDynamicAspectRatio(.aspectRatio16x9)
+                print("Initial aspect ratio set to 16:9")
+                device.videoZoomFactor = 1.0
+//            } catch {
+//                print("Unable to set initial framing configuration: \(error)")
+            }
+        }
+    }
+
     private func buildCaptureSession(addAudio: Bool) -> Bool {
         guard !isConfigured else { return true }
 
@@ -184,19 +316,39 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         session.beginConfiguration()
         usingWideFrontSensor = false
 
-        guard let videoDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+        var smartFramingEnabled = false
+        let videoDevice: AVCaptureDevice
+
+        if #available(iOS 18.0, *), let smartDevice = findAndConfigureSmartFramingDevice() {
+            videoDevice = smartDevice
+            smartFramingEnabled = true
+            currentVideoDevice = smartDevice
+            print("Using smart framing device")
+        } else if let defaultDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) {
+            videoDevice = defaultDevice
+            currentVideoDevice = defaultDevice
+            print("Using default front camera (no smart framing)")
+        } else {
             session.commitConfiguration()
+            print("No suitable video device found")
             return false
         }
 
         do {
             try videoDevice.lockForConfiguration()
+            defer { videoDevice.unlockForConfiguration() }
 
-            if let preferredFormat = bestLandscapeFrontFormat(for: videoDevice) {
+            var detectedWideSensor = false
+
+            if smartFramingEnabled {
+                videoDevice.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+                videoDevice.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+                detectedWideSensor = true
+            } else if let preferredFormat = bestLandscapeFrontFormat(for: videoDevice) {
                 videoDevice.activeFormat = preferredFormat
                 videoDevice.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
                 videoDevice.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-                usingWideFrontSensor = isNewWideFrontSensorFormat(preferredFormat)
+                detectedWideSensor = isNewWideFrontSensorFormat(preferredFormat)
             } else if let fallback = videoDevice.formats
                 .filter({ format in
                     let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
@@ -214,19 +366,21 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
                 videoDevice.activeFormat = fallback
                 videoDevice.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
                 videoDevice.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
-                usingWideFrontSensor = isNewWideFrontSensorFormat(fallback)
+                detectedWideSensor = isNewWideFrontSensorFormat(fallback)
             }
 
-            videoDevice.unlockForConfiguration()
+            usingWideFrontSensor = smartFramingEnabled || detectedWideSensor
         } catch {
             usingWideFrontSensor = false
             session.commitConfiguration()
+            print("Failed to configure video device: \(error)")
             return false
         }
 
         guard let videoInput = try? AVCaptureDeviceInput(device: videoDevice),
               session.canAddInput(videoInput) else {
             session.commitConfiguration()
+            print("Failed to create or add video input")
             return false
         }
         session.addInput(videoInput)
@@ -236,18 +390,32 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
            let audioInput = try? AVCaptureDeviceInput(device: audioDevice),
            session.canAddInput(audioInput) {
             session.addInput(audioInput)
+            print("Audio input added")
         }
 
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
+            print("Movie output added")
         }
 
         session.commitConfiguration()
+        
+        // Configure smart framing monitor after session is committed
+        if #available(iOS 18.0, *), smartFramingEnabled {
+            configureSmartFramingMonitor(for: videoDevice)
+        }
+        
         isConfigured = true
+        print("Capture session configured successfully")
         return true
     }
 
     private func teardownSession() {
+        // Stop smart framing monitoring first
+        if #available(iOS 18.0, *) {
+            stopSmartFramingMonitoring()
+        }
+        
         session.beginConfiguration()
         for input in session.inputs { session.removeInput(input) }
         for output in session.outputs { session.removeOutput(output) }
@@ -255,7 +423,8 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
 
         isConfigured = false
         usingWideFrontSensor = false
-
+        currentVideoDevice = nil
+        
         if micAuthorized {
             do {
                 try AVAudioSession.sharedInstance().setActive(false)
@@ -272,6 +441,8 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         if let error {
             print("Recording error: \(error)")
             try? FileManager.default.removeItem(at: outputFileURL)
+        } else {
+            print("Recording saved to: \(outputFileURL)")
         }
 
         DispatchQueue.main.async { self.isRecording = false }
@@ -348,3 +519,4 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         }
     }
 }
+
