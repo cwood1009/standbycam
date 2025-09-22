@@ -295,11 +295,20 @@ final class RecordingController: NSObject, ObservableObject, AVCaptureFileOutput
         // Set initial dynamic aspect ratio to 16:9 if supported
         Task {
             do {
-//                try await device.setDynamicAspectRatio(.aspectRatio16x9)
-                print("Initial aspect ratio set to 16:9")
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+
+                do {
+                    try await device.setDynamicAspectRatio(.aspectRatio16x9)
+                    print("Initial aspect ratio set to 16:9")
+                } catch {
+                    print("Unable to set initial framing configuration: \(error)")
+                }
+
                 device.videoZoomFactor = 1.0
-//            } catch {
-//                print("Unable to set initial framing configuration: \(error)")
+                print("Initial zoom factor reset to 1.0")
+            } catch {
+                print("Unable to lock device for initial smart framing configuration: \(error)")
             }
         }
     }
